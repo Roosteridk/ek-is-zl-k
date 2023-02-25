@@ -5,32 +5,76 @@ import {
 import * as cheerio from "npm:cheerio";
 import { FingerprintGenerator } from "npm:fingerprint-generator";
 
-export class Eksi {
+type Options = {
+  reqDelay?: number;
+  maxRetries?: number;
+};
+export class EksiSozluk {
   static readonly baseUrl = "https://eksisozluk.com/";
   private username?: string;
   private password?: string;
   private cookies: CookieJar;
   private fingerprint: Headers;
+  private reqDelay: number;
+  private maxRetries: number;
 
-  constructor() {
+  constructor(options?: Options) {
+    this.reqDelay = options?.reqDelay ?? 250;
+    this.maxRetries = options?.maxRetries ?? 5;
     this.cookies = new CookieJar();
     this.fingerprint = new FingerprintGenerator()
       .getHeaders() as unknown as Headers;
   }
 
-  // 5 requests per second (delay 200ms)
   private static rateLimit = Promise.resolve();
-  private async fetch(input: string | URL, init?: RequestInit) {
-    await Eksi.rateLimit;
-    Eksi.rateLimit = new Promise((resolve) => setTimeout(resolve, 200));
-    return fetch(new URL(input, Eksi.baseUrl), {
-      ...init,
-      headers: {
-        "X-Requested-With": "XMLHttpRequest",
-        ...init?.headers,
-        ...this.fingerprint,
-      },
-    });
+  private static retryCount = 0;
+  private async fetch(
+    input: string | URL,
+    init?: RequestInit,
+  ): Promise<Response> {
+    await EksiSozluk.rateLimit;
+    const wrappedFetch = wrapFetch({ cookieJar: this.cookies });
+    const retry = async () => {
+      EksiSozluk.retryCount++;
+      if (EksiSozluk.retryCount > this.maxRetries) {
+        throw new Error("Max retries exceeded");
+      }
+      console.log("Retrying...");
+      // Retry after 5 seconds
+      await sleep(5000);
+      return this.fetch(input, init);
+    };
+
+    EksiSozluk.rateLimit = sleep(this.reqDelay);
+    let res: Response;
+
+    try {
+      res = await wrappedFetch(new URL(input, EksiSozluk.baseUrl), {
+        ...init,
+        headers: {
+          "X-Requested-With": "XMLHttpRequest",
+          ...init?.headers,
+          ...this.fingerprint,
+        },
+      });
+    } catch (e) {
+      console.error(e);
+      res = await retry();
+    }
+    if (!res.ok) {
+      if (res.status === 429) {
+        // Too many requests
+        return await retry();
+      } else if (res.status === 503) {
+        // Service unavailable
+        return await retry();
+      } else {
+        throw new Error("Request failed: " + res.status + " " + res.statusText);
+      }
+    }
+    // Reset retry count since request was successful
+    EksiSozluk.retryCount = 0;
+    return res;
   }
 
   /**
@@ -72,7 +116,7 @@ export class Eksi {
     endpoint: string | URL,
     init?: RequestInit,
   ) {
-    const url = new URL(endpoint, Eksi.baseUrl);
+    const url = new URL(endpoint, EksiSozluk.baseUrl);
     const res = await this.fetch(url, init);
     const html = await res.text();
     return cheerio.load(html);
@@ -97,7 +141,7 @@ export class Eksi {
   }
 
   async entries(title: string, query?: TopicQuery) {
-    let url = new URL(title, Eksi.baseUrl);
+    let url = new URL(title, EksiSozluk.baseUrl);
     // Need to get first page to resolve titleId for the params to work
     url.searchParams.set("p", "1");
     const res = await this.fetch(url);
@@ -105,7 +149,7 @@ export class Eksi {
     const $ = cheerio.load(html);
     url = new URL(res.url);
     // TODO: add query params
-    return new Eksi.Page<Entry>(
+    return new EksiSozluk.Page<Entry>(
       this,
       query ? await this.fetchPage(url) : $,
       this.transformTopic,
@@ -114,7 +158,7 @@ export class Eksi {
   }
 
   async entry(id: number) {
-    const url = new URL("entry/" + id, Eksi.baseUrl);
+    const url = new URL("entry/" + id, EksiSozluk.baseUrl);
     const res = await this.fetch(url);
     const html = await res.text();
     const $ = cheerio.load(html);
@@ -126,7 +170,7 @@ export class Eksi {
     readonly currentPage: number;
 
     constructor(
-      private eksi: Eksi,
+      private eksi: EksiSozluk,
       private $: ReturnType<typeof cheerio.load>,
       private transform: (page: typeof $) => T[],
       private url: URL,
@@ -152,21 +196,21 @@ export class Eksi {
   };
 
   author(nick: string) {
-    return new Eksi.Author(this, nick);
+    return new EksiSozluk.Author(this, nick);
   }
 
   // Maybe TODO: lazy load author props
   private static Author = class Author {
-    #eksi: Eksi;
-    constructor(eksi: Eksi, public nick: string) {
+    #eksi: EksiSozluk;
+    constructor(eksi: EksiSozluk, public nick: string) {
       this.#eksi = eksi;
     }
 
     async entries(page = 1) {
-      const url = new URL("son-entryleri", Eksi.baseUrl);
+      const url = new URL("son-entryleri", EksiSozluk.baseUrl);
       url.searchParams.set("nick", this.nick);
       url.searchParams.set("p", page + "");
-      return new Eksi.Page(
+      return new EksiSozluk.Page(
         this.#eksi,
         await this.#eksi.fetchPage(url),
         this.#eksi.transformTopic,
@@ -175,12 +219,12 @@ export class Eksi {
     }
 
     async favoriteAuthors() {
-      const url = new URL("favori-yazarlari", Eksi.baseUrl);
+      const url = new URL("favori-yazarlari", EksiSozluk.baseUrl);
       url.searchParams.set("nick", this.nick);
       const $ = await this.#eksi.fetchPage(url);
       return $("td:nth-child(1)").toArray().map((el) => {
         const author = $(el);
-        return new Eksi.Author(this.#eksi, author.text().trim());
+        return new EksiSozluk.Author(this.#eksi, author.text().trim());
       });
     }
 
@@ -252,3 +296,7 @@ type TopicQuery = {
   //search?: string;
   //sort?: "popular" | "nice" | "dailynice" | "newbies" | "eksiseyler" | ""
 };
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
